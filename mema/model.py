@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import torch.nn as nn
-import torch
-from einops import einsum, rearrange
 from typing import Annotated
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from einops import einsum
+from einops import rearrange
 
 
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
@@ -73,30 +76,13 @@ class Attention(nn.Module):
 
         self.use_rotary_pos_emb = use_rotary_pos_emb
 
-    def _rotate_half(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
-    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
-        x = rearrange(x, '... (j d) -> ... j d', j=2)
-        x1, x2 = x.unbind(dim=-2)
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(
-        self,
-        freqs: Annotated[torch.Tensor, ..., 'T', 'L'],
-        x: Annotated[torch.Tensor, ..., 'T', 'K'],
-        scale: float | int,
-    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
-        seq_len = x.shape[-2]
-        freqs = freqs[-seq_len:, :]
-        return (x * freqs.cos() * scale) + (self._rotate_half(x) * freqs.sin() * scale)
-
     def forward(
         self,
         q: Annotated[torch.Tensor, ..., 'T', 'K'],
         k: Annotated[torch.Tensor, ..., 'T', 'K'],
         v: Annotated[torch.Tensor, ..., 'T', 'V'],
         mask: Annotated[torch.Tensor, 'T', 'T'] | None = None,
-        rotary_freqs: Annotated[torch.Tensor, ..., 'T', 'L'] | None = None,
+        rotary_freqs: Annotated[torch.Tensor, 'T', 'L'] | None = None,
         rotary_pos_scale: float = 1.0,
     ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
         assert q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
@@ -115,13 +101,14 @@ class Attention(nn.Module):
             assert rotary_freqs is not None
 
             L = rotary_freqs.shape[-1]
-            q_scale = k_scale = (rotary_pos_scale, rotary_pos_scale**-1.0)
+            q_scale, k_scale = (rotary_pos_scale, rotary_pos_scale**-1.0)
             (ql, qr), (kl, kr), (vl, vr) = map(
                 lambda t: (t[..., :L], t[..., L:]), (q_i, k_i, v_i)
             )
+
+            args = ((ql, q_scale), (kl, k_scale), (vl, k_scale))
             ql, kl, vl = map(
-                lambda args: self._apply_rotary_pos_emb(rotary_freqs, *args),
-                ((ql, q_scale), (kl, k_scale), (vl, k_scale)),
+                lambda args: self._rotary_pos_emb(rotary_freqs, *args), args
             )
             q_i, k_i, v_i = map(
                 lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr))
@@ -143,6 +130,23 @@ class Attention(nn.Module):
         vals = einsum('... H T i, ... H i v -> ... H T v', attn, v_i)
         out = self.w_o(rearrange(vals, '... H T v -> ... T (H v)'))
         return out
+
+    def _rotate_half(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
+    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
+        x = rearrange(x, '... (j d) -> ... j d', j=2)
+        x1, x2 = x.unbind(dim=-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _rotary_pos_emb(
+        self,
+        freqs: Annotated[torch.Tensor, 'T', 'L'],
+        x: Annotated[torch.Tensor, ..., 'T', 'K'],
+        scale: float | int,
+    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
+        seq_len = x.shape[-2]
+        freqs = freqs[-seq_len:, :]
+        return (x * freqs.cos() * scale) + (self._rotate_half(x) * freqs.sin() * scale)
 
 
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
@@ -166,9 +170,16 @@ class AttentionLayer(nn.Module):
             self.ff_norm = nn.LayerNorm(dim)
 
     def forward(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
+        self,
+        x: Annotated[torch.Tensor, ..., 'T', 'K'],
+        mask: Annotated[torch.Tensor, 'T', 'T'],
+        rotary_freqs: Annotated[torch.Tensor, 'T', 'L'],
     ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
-        out = self.norm(x + self.attention(x, x, x))
+        attn = self.attention(x, x, x, mask=mask, rotary_freqs=rotary_freqs)
+        out = self.norm(x + attn)
         if self.use_ff:
+            if TYPE_CHECKING:
+                assert self.ff_linear is not None
+                assert self.ff_norm is not None
             out = self.ff_norm(out + self.ff_linear(out))
         return out
