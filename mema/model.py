@@ -36,6 +36,8 @@ class Attention(nn.Module):
     k_dim_head: int
     v_dim_head: int
 
+    use_rotary_pos_emb: bool
+
     def __init__(
         self,
         dim: int,
@@ -44,6 +46,7 @@ class Attention(nn.Module):
         v_dim_head: int = 64,
         value_dim: int | None = None,
         out_dim: int | None = None,
+        use_rotary_pos_emb: bool = True,
     ) -> None:
         super().__init__()
 
@@ -68,12 +71,33 @@ class Attention(nn.Module):
         self.w_v = nn.Linear(self.value_dim, v_dim, bias=False)
         self.w_o = nn.Linear(v_dim, self.out_dim, bias=False)
 
+        self.use_rotary_pos_emb = use_rotary_pos_emb
+
+    def _rotate_half(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
+    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
+        x = rearrange(x, '... (j d) -> ... j d', j=2)
+        x1, x2 = x.unbind(dim=-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rotary_pos_emb(
+        self,
+        freqs: Annotated[torch.Tensor, ..., 'T', 'L'],
+        x: Annotated[torch.Tensor, ..., 'T', 'K'],
+        scale: float | int,
+    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
+        seq_len = x.shape[-2]
+        freqs = freqs[-seq_len:, :]
+        return (x * freqs.cos() * scale) + (self._rotate_half(x) * freqs.sin() * scale)
+
     def forward(
         self,
         q: Annotated[torch.Tensor, ..., 'T', 'K'],
         k: Annotated[torch.Tensor, ..., 'T', 'K'],
         v: Annotated[torch.Tensor, ..., 'T', 'V'],
         mask: Annotated[torch.Tensor, 'T', 'T'] | None = None,
+        rotary_freqs: Annotated[torch.Tensor, ..., 'T', 'L'] | None = None,
+        rotary_pos_scale: float = 1.0,
     ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
         assert q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
         assert q.shape[-1] == k.shape[-1] == self.dim
@@ -85,6 +109,23 @@ class Attention(nn.Module):
         q_i = rearrange(self.w_q(q), '... T (H k) -> ... H T k', H=self.num_heads)
         k_i = rearrange(self.w_k(k), '... T (H k) -> ... H T k', H=self.num_heads)
         v_i = rearrange(self.w_v(v), '... T (H v) -> ... H T v', H=self.num_heads)
+
+        # apply rotary positional embeddings
+        if self.use_rotary_pos_emb:
+            assert rotary_freqs is not None
+
+            L = rotary_freqs.shape[-1]
+            q_scale = k_scale = (rotary_pos_scale, rotary_pos_scale**-1.0)
+            (ql, qr), (kl, kr), (vl, vr) = map(
+                lambda t: (t[..., :L], t[..., L:]), (q_i, k_i, v_i)
+            )
+            ql, kl, vl = map(
+                lambda args: self._apply_rotary_pos_emb(rotary_freqs, *args),
+                ((ql, q_scale), (kl, k_scale), (vl, k_scale)),
+            )
+            q_i, k_i, v_i = map(
+                lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr))
+            )
 
         # use scaled dot product similarity
         s_qk = einsum('... H i k, ... H j k -> ... H i j', q_i, k_i)
@@ -101,4 +142,33 @@ class Attention(nn.Module):
 
         vals = einsum('... H T i, ... H i v -> ... H T v', attn, v_i)
         out = self.w_o(rearrange(vals, '... H T v -> ... T (H v)'))
+        return out
+
+
+# Attention Is All You Need https://arxiv.org/abs/1706.03762
+class AttentionLayer(nn.Module):
+    attention: Attention
+    norm: nn.LayerNorm
+
+    use_ff: bool
+    ff_linear: nn.Linear | None = None
+    ff_norm: nn.LayerNorm | None = None
+
+    def __init__(
+        self, dim: int = 2048, num_heads: int = 16, use_ff: bool = True
+    ) -> None:
+        self.attention = Attention(dim=dim, num_heads=num_heads)
+        self.norm = nn.LayerNorm(dim)
+
+        self.use_ff = use_ff
+        if self.use_ff:
+            self.ff_linear = nn.Linear(dim, dim, bias=False)
+            self.ff_norm = nn.LayerNorm(dim)
+
+    def forward(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
+    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
+        out = self.norm(x + self.attention(x, x, x))
+        if self.use_ff:
+            out = self.ff_norm(out + self.ff_linear(out))
         return out
