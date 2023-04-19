@@ -99,19 +99,8 @@ class Attention(nn.Module):
         # apply rotary positional embeddings
         if self.use_rotary_pos_emb:
             assert rotary_freqs is not None
-
-            L = rotary_freqs.shape[-1]
-            q_scale, k_scale = (rotary_pos_scale, rotary_pos_scale**-1.0)
-            (ql, qr), (kl, kr), (vl, vr) = map(
-                lambda t: (t[..., :L], t[..., L:]), (q_i, k_i, v_i)
-            )
-
-            args = ((ql, q_scale), (kl, k_scale), (vl, k_scale))
-            ql, kl, vl = map(
-                lambda args: self._rotary_pos_emb(rotary_freqs, *args), args
-            )
-            q_i, k_i, v_i = map(
-                lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr))
+            q_i, k_i, v_i = self.rotary_pos_emb(
+                q_i, k_i, v_i, rotary_freqs, rotary_pos_scale
             )
 
         # use scaled dot product similarity
@@ -138,7 +127,7 @@ class Attention(nn.Module):
         x1, x2 = x.unbind(dim=-2)
         return torch.cat((-x2, x1), dim=-1)
 
-    def _rotary_pos_emb(
+    def _apply_rotary_pos_emb(
         self,
         freqs: Annotated[torch.Tensor, 'T', 'L'],
         x: Annotated[torch.Tensor, ..., 'T', 'K'],
@@ -147,6 +136,25 @@ class Attention(nn.Module):
         seq_len = x.shape[-2]
         freqs = freqs[-seq_len:, :]
         return (x * freqs.cos() * scale) + (self._rotate_half(x) * freqs.sin() * scale)
+
+    def rotary_pos_emb(
+        self,
+        q: Annotated[torch.Tensor, ..., 'T', 'K'],
+        k: Annotated[torch.Tensor, ..., 'T', 'K'],
+        v: Annotated[torch.Tensor, ..., 'T', 'V'],
+        freqs: Annotated[torch.Tensor, 'T', 'L'],
+        scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        L = freqs.shape[-1]
+        q_scale, k_scale = (scale, scale**-1.0)
+        (ql, qr), (kl, kr), (vl, vr) = map(
+            lambda t: (t[..., :L], t[..., L:]), (q, k, v)
+        )
+
+        args = ((ql, q_scale), (kl, k_scale), (vl, k_scale))
+        ql, kl, vl = map(lambda args: self._rotary_pos_emb(freqs, *args), args)
+        q, k, v = map(lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr)))
+        return q, k, v
 
 
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
