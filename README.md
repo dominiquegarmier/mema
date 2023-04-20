@@ -14,11 +14,11 @@
 ```
 
 ```bibtex
-@misc{zhong2022training,
-      title={Training Language Models with Memory Augmentation},
-      author={Zexuan Zhong and Tao Lei and Danqi Chen},
+@misc{su2022roformer,
+      title={RoFormer: Enhanced Transformer with Rotary Position Embedding},
+      author={Jianlin Su and Yu Lu and Shengfeng Pan and Ahmed Murtadha and Bo Wen and Yunfeng Liu},
       year={2022},
-      eprint={2205.12674},
+      eprint={2104.09864},
       archivePrefix={arXiv},
       primaryClass={cs.CL}
 }
@@ -32,5 +32,16 @@
       eprint={1810.12575},
       archivePrefix={arXiv},
       primaryClass={cs.CV}
+}
+```
+
+```bibtex
+@misc{zhong2022training,
+      title={Training Language Models with Memory Augmentation},
+      author={Zexuan Zhong and Tao Lei and Danqi Chen},
+      year={2022},
+      eprint={2205.12674},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
 }
 ```
