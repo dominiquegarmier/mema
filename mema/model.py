@@ -373,3 +373,30 @@ class MemoryLayer(nn.Module):
 
         out = self.ff_norm(x + cast)
         return out
+
+
+class BatchMemory(nn.Module):
+    num_documents: int
+    context: int
+
+    dim: int
+    key_dim: int
+    value_dim: int
+
+    def __init__(
+        self,
+        dim: int = 1024,
+        num_documents: int = 32,
+        context: int = 4096,
+        value_dim: int = 256,
+        key_dim: int = 256,
+    ) -> None:
+        super().__init__()
+
+    def forward(
+        self, batch: Annotated[torch.Tensor, ..., 'D', 'T', 'E']
+    ) -> tuple[
+        Annotated[torch.Tensor, ..., 'N', 'K'],
+        Annotated[torch.Tensor, ..., 'N', 'V'],
+    ]:
+        raise NotImplementedError
