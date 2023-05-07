@@ -10,9 +10,89 @@ from einops import einsum
 from einops import rearrange
 
 
+# https://arxiv.org/abs/1910.07467
+class RMSNorm(nn.Module):
+    eps: float
+    dim: int
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+
+        self.var_eps = eps
+        self.dim = dim
+
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Annotated[torch.Tensor, ...]) -> Annotated[torch.Tensor, ...]:
+        var = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.var_eps)
+
+        if self.weight.dtype != x.dtype:
+            x = x.to(self.weight.dtype)
+
+        return self.weight * x
+
+
+class MultiLayerPerceptron(nn.Module):
+    dim: int
+    hidden_dim: int
+
+    lin_in: nn.Linear
+    lin_out: nn.Linear
+    act: nn.GELU
+
+    def __init__(
+        self, dim: int, hidden_dim: int | None, expansion_ratio: float = 1.0
+    ) -> None:
+        """\
+        if hidden_dim is not specified, it will be set to dim * expansion_ratio else expansion_ratio will be ignored
+        """
+        self.dim = dim
+        self.hidden_dim = hidden_dim or int(dim * expansion_ratio)
+
+        self.lin_in = nn.Linear(self.dim, self.hidden_dim)
+        self.lin_out = nn.Linear(self.hidden_dim, self.dim)
+        self.act = nn.GELU()  # TODO support other activations
+
+    def forward(
+        self, x: Annotated[torch.Tensor, ..., 'D']
+    ) -> Annotated[torch.Tensor, ..., 'D']:
+        return self.lin_out(self.act(self.lin_in(x)))
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    ferqs: torch.Tensor
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer('freqs', torch.zeros(1))
+
+    def foward(self) -> None:
+        raise NotImplementedError
+
+    def apply_rotary_embeds(self) -> None:
+        raise NotImplementedError
+
+    def _rotate_half(self) -> None:
+        raise NotImplementedError
+
+
+def apply_causal_mask(
+    x: Annotated[torch.Tensor, ..., 'T', 'T']
+) -> Annotated[torch.Tensor, ..., 'T', 'T']:
+    assert x.shape[-2] == x.shape[-1]
+    L = x.shape[-1]
+
+    mask_value = -torch.finfo(x.dtype).max
+    mask = torch.triu(torch.ones(L, L, device=x.device), 1)
+
+    return torch.masked_fill(x, ~mask, mask_value)
+
+
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
-class Attention(nn.Module):
-    '''\
+class MultiHeadedAttention(nn.Module):
+
+    """\
     some implementation details were taken from https://github.com/lucidrains/x-transformers
     which is licended under the...
 
@@ -29,7 +109,7 @@ class Attention(nn.Module):
 
     The above copyright notice and this permission notice shall be included in all
     copies or substantial portions of the Software.
-    '''
+    """
 
     dim: int
     value_dim: int
@@ -96,7 +176,6 @@ class Attention(nn.Module):
         k_i = rearrange(self.w_k(k), '... T (H k) -> ... H T k', H=self.num_heads)
         v_i = rearrange(self.w_v(v), '... T (H v) -> ... H T v', H=self.num_heads)
 
-        # apply rotary positional embeddings
         if self.use_rotary_pos_emb:
             assert rotary_freqs is not None
             q_i, k_i, v_i = self.rotary_pos_emb(
@@ -155,248 +234,3 @@ class Attention(nn.Module):
         ql, kl, vl = map(lambda args: self._rotary_pos_emb(freqs, *args), args)
         q, k, v = map(lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr)))
         return q, k, v
-
-
-# Attention Is All You Need https://arxiv.org/abs/1706.03762
-class AttentionLayer(nn.Module):
-    dim: int
-    out_dim: int
-
-    attention: Attention
-    norm: nn.LayerNorm
-
-    use_ff: bool
-    ff_linear: nn.Linear | None = None
-    ff_norm: nn.LayerNorm | None = None
-
-    def __init__(
-        self,
-        dim: int = 2048,
-        out_dim: int | None = None,
-        num_heads: int = 16,
-        use_ff: bool = True,
-    ) -> None:
-        self.dim = dim
-        self.out_dim = out_dim or dim
-
-        self.attention = Attention(dim=self.dim, num_heads=num_heads)
-        self.norm = nn.LayerNorm(self.dim)
-
-        self.use_ff = use_ff
-        if self.use_ff:
-            self.ff_linear = nn.Linear(self.dim, self.out_dim, bias=False)
-            self.ff_norm = nn.LayerNorm(self.out_dim)
-
-    def forward(
-        self,
-        x: Annotated[torch.Tensor, ..., 'T', 'D'],
-        mask: Annotated[torch.Tensor, 'T', 'T'],
-    ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
-        # TODO add support for rotary positional embeddings
-        attn = self.attention(x, x, x, mask=mask)
-        out = self.norm(x + attn)
-        if self.use_ff:
-            if TYPE_CHECKING:
-                assert self.ff_linear is not None
-                assert self.ff_norm is not None
-            out = self.ff_norm(out + self.ff_linear(out))
-        return out
-
-
-# Neural Nearest Neighbor Networks https://arxiv.org/abs/1810.12575
-class NeuralKNearestNeighbor(nn.Module):
-    '''\
-    implementation details were taken from https://github.com/DominiqueGarmier/neural-nearest-neighbor
-    which is licended under the...
-
-    MIT License
-
-    Copyright (c) 2023 Dominique Garmier
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the "Software"), to deal
-    in the Software without restriction, including without limitation the rights
-    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-    copies of the Software, and to permit persons to whom the Software is
-    furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-    '''
-
-    _k: int
-    _temp: float
-    _dim: int
-    _feature: int
-
-    _no_values: bool = False
-
-    def __init__(
-        self, k: int, dim: int, temp: float, feature: int | None = None
-    ) -> None:
-        super().__init__()
-        self._k = k
-        self._temp = temp
-
-        self._dim = dim
-        self._feature = feature or dim
-        if feature is None:
-            self._no_values = True
-
-    def forward(
-        self,
-        query: Annotated[torch.Tensor, ..., 'D'],
-        keys: Annotated[torch.Tensor, ..., 'D', 'N'],
-        values: Annotated[torch.Tensor, ..., 'F', 'N'] | None = None,
-    ) -> Annotated[torch.Tensor, ..., 'K', 'F']:
-        if values is None:
-            assert self._no_values
-            values = keys
-        assert query.shape[-1] == keys.shape[-2] == self._dim
-        assert values.shape[-2] == self._feature
-        assert keys.shape[-1] == values.shape[-1]
-
-        sims = self._similarity(query, keys)
-        omega = self._compute_omega(s=sims, k=self._k, t=self._temp)
-        k_nearest = einsum(omega, values, '... N K, ... F N -> ... K F')
-        return k_nearest
-
-    def _similarity(
-        self,
-        query: Annotated[torch.Tensor, ..., 'D'],
-        key: Annotated[torch.Tensor, ..., 'D', 'N'],
-    ) -> Annotated[torch.Tensor, ..., 'N']:
-        return -einsum(query, key, '... D, ... D N -> ... N') / (self._dim**0.5)
-
-    def _compute_omega(
-        self, s: Annotated[torch.Tensor, ..., 'N'], k: int, t: float
-    ) -> Annotated[torch.Tensor, ..., 'N', 'K']:
-        alpha = F.softmax(s, dim=-1)
-        omega = torch.empty(*s.shape, k)
-
-        omega[..., 0] = F.softmax(alpha / t, dim=-1)
-        for i in range(1, k):
-            alpha = alpha + torch.log(1 - omega[..., i - 1])
-            omega[..., i] = F.softmax(alpha / t, dim=-1)
-
-        return omega
-
-
-class TopicalTransformer(nn.Module):
-    dim: int
-    query_dim: int
-
-    num_layers: int
-    layers: nn.ModuleList
-
-    def __init__(
-        self, dim: int = 1024, query_dim: int = 256, num_layers: int = 2
-    ) -> None:
-        super().__init__()
-
-        self.dim = dim
-        self.query_dim = query_dim
-
-        self.num_layers = num_layers
-        self.layers = nn.ModuleList()
-        for i in range(self.num_layers):
-            ...  # TODO
-
-    def forward(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'D']
-    ) -> Annotated[torch.Tensor, ..., 'Q']:
-        raise NotImplementedError
-
-
-class MemoryLayer(nn.Module):
-    '''\
-    layer that injects memory using nknn
-    '''
-
-    dim: int
-    key_dim: int
-    value_dim: int
-    memory_dim: int
-
-    top_k: int
-    context: int
-
-    query_model: TopicalTransformer
-    neural_knn: NeuralKNearestNeighbor
-
-    ff_dim: nn.Linear
-    ff_context: nn.Linear
-    ff_norm: nn.LayerNorm
-
-    def __init__(
-        self,
-        dim: int = 1024,
-        top_k: int = 32,
-        context: int = 2048,
-        key_dim: int = 256,
-        value_dim: int = 256,
-        memory_dim: int = 16384,
-    ) -> None:
-        super().__init__()
-
-        self.dim = dim
-        self.key_dim = key_dim
-        self.value_dim = value_dim
-        self.memory_dim = memory_dim
-
-        self.top_k = top_k
-        self.context = context
-
-        self.query_model = TopicalTransformer(dim=self.dim, query_dim=self.key_dim)
-        self.neural_knn = NeuralKNearestNeighbor(
-            k=top_k, dim=self.key_dim, temp=0.1, feature=self.value_dim
-        )
-
-        self.ff_dim = nn.Linear(self.value_dim, self.value_dim, bias=False)
-        self.ff_context = nn.Linear(self.value_dim, self.dim, bias=False)
-        self.ff_norm = nn.LayerNorm(self.value_dim)
-
-    def forward(
-        self,
-        x: Annotated[torch.Tensor, ..., 'T', 'D'],
-        keys: Annotated[torch.Tensor, ..., 'K', 'N'],
-        values: Annotated[torch.Tensor, ..., 'V', 'N'],
-    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
-        assert x.shape[-1] == self.dim
-        query: Annotated[torch.Tensor, ..., 'Q'] = self.query_model(x)
-        value = self.neural_knn(query, keys, values)
-
-        cast = self.ff_dim(value)
-        cast = rearrange(cast, '... K V -> ... V K')
-        cast = self.ff_context(cast)
-        cast = rearrange(cast, '... V T -> ... T V')
-
-        out = self.ff_norm(x + cast)
-        return out
-
-
-class BatchMemory(nn.Module):
-    num_documents: int
-    context: int
-
-    dim: int
-    key_dim: int
-    value_dim: int
-
-    def __init__(
-        self,
-        dim: int = 1024,
-        num_documents: int = 32,
-        context: int = 4096,
-        value_dim: int = 256,
-        key_dim: int = 256,
-    ) -> None:
-        super().__init__()
-
-    def forward(
-        self, batch: Annotated[torch.Tensor, ..., 'D', 'T', 'E']
-    ) -> tuple[
-        Annotated[torch.Tensor, ..., 'N', 'K'],
-        Annotated[torch.Tensor, ..., 'N', 'V'],
-    ]:
-        raise NotImplementedError
