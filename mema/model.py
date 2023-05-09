@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Annotated
 from typing import TYPE_CHECKING
 
@@ -60,21 +61,88 @@ class MultiLayerPerceptron(nn.Module):
         return self.lin_out(self.act(self.lin_in(x)))
 
 
-class RotaryPositionalEmbedding(nn.Module):
-    ferqs: torch.Tensor
+# https://arxiv.org/abs/2104.09864
+class RotaryEmbedding(nn.Module):
+    """\
+    Roatary Embeddings as presented in the paper https://arxiv.org/abs/2104.09864
+    does not contain any trainable parameters can be placed in the root nn.Module to allow for efficient caching.
+    """
 
+    theta: float
+    dim: int
+
+    _seq_len_cached: int
+    _freqs_cis: Annotated[torch.Tensor, torch.complex64, 'T', 'D']
+    _scale: Annotated[torch.Tensor, 'D']
+
+    def __init__(self, dim: int, seq_len: int = 2048, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+        assert seq_len >= 1
+        freqs_cis = self._get_freqs_cis(seq_len)
+        self.register_buffer('_freqs_cis', freqs_cis)
+
+    def _get_freqs_cis(
+        self, seq_len: int, device: torch.device | None = None
+    ) -> Annotated[torch.Tensor, torch.complex64, 'T', 'D']:
+        self._seq_len_cached = seq_len
+        half = self.dim // 2  # only apply to half of the dimensions, see the paper
+        freqs = self.theta ** -(
+            torch.arange(0, half, device=device or 'cpu').float() / half
+        )
+        seq = torch.arange(seq_len, device=freqs.device)
+        freqs = einsum(seq, freqs, 'T, D -> T D')
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis
+
+    def get_freqs_cis(
+        self, seq_len: int, device: torch.device
+    ) -> Annotated[torch.Tensor, torch.complex64, 'T', 'D/2']:
+        if seq_len > self._seq_len_cached:
+            next_power_of_two = 2 ** math.ceil(math.log2(seq_len))
+            freqs_cis = self._get_freqs_cis(next_power_of_two, device=device)
+            self.register_buffer('_freqs_cis', freqs_cis)
+        return self._freqs_cis[-seq_len:, :]
+
+    @staticmethod
+    def rotate_half(
+        x: Annotated[torch.Tensor, ..., 'D']
+    ) -> Annotated[torch.Tensor, ..., 'D']:
+        x = rearrange(x, '... (j d) -> ... j d', j=2)
+        x1, x2 = x.unbind(dim=-2)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(
+        self,
+        x: Annotated[torch.Tensor, ..., 'T', 'D'],
+    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
+        """applies rotary embeddings to x"""
+        freqs_cis = self.get_freqs_cis(x.shape[-2], device=x.device)
+        assert x.shape[-1] == freqs_cis.shape[-1]
+
+        freqs_cos = torch.view_as_real(freqs_cis)
+        freqs_sin = torch.view_as_complex(freqs_cis)
+        return (x * freqs_cos) + (self.rotate_half(x) * freqs_sin)
+
+
+class CausalMask(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.register_buffer('freqs', torch.zeros(1))
+        # TODO register buffers etc
 
-    def foward(self) -> None:
-        raise NotImplementedError
-
-    def apply_rotary_embeds(self) -> None:
-        raise NotImplementedError
-
-    def _rotate_half(self) -> None:
-        raise NotImplementedError
+    def foward(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'T'], offset: int = 0
+    ) -> Annotated[torch.Tensor, torch.bool, 'T', 'T']:
+        '''\
+        return causal mask for x
+        '''
+        mask_value = -torch.finfo(x.dtype).max
+        mask = torch.ones(
+            x.shape[-2], x.shape[-1], dtype=torch.bool, device=x.device
+        ).triu(offset)
+        return torch.masked_fill(x, ~mask, mask_value)
 
 
 def apply_causal_mask(
