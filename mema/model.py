@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Annotated
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,17 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
+class LayerNorm(nn.Module):
+    norm: nn.LayerNorm
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+
+    def foward(self, x: Annotated[torch.Tensor, ...]) -> Annotated[torch.Tensor, ...]:
+        return self.norm(x)
+
+
 class MultiLayerPerceptron(nn.Module):
     dim: int
     hidden_dim: int
@@ -62,7 +74,7 @@ class MultiLayerPerceptron(nn.Module):
 
 
 # https://arxiv.org/abs/2104.09864
-class RotaryEmbedding(nn.Module):
+class RotaryPositionEmbedding(nn.Module):
     """\
     Roatary Embeddings as presented in the paper https://arxiv.org/abs/2104.09864
     does not contain any trainable parameters can be placed in the root nn.Module to allow for efficient caching.
@@ -127,39 +139,49 @@ class RotaryEmbedding(nn.Module):
         return (x * freqs_cos) + (self.rotate_half(x) * freqs_sin)
 
 
-class CausalMask(nn.Module):
-    def __init__(self) -> None:
+# https://arxiv.org/abs/2108.12409
+class AttentionLinearBias(nn.Module):
+    _cached_seq_len: int
+    _bias_buffer: Annotated[torch.Tensor, 'T', 'T']
+    _factor: float
+
+    def __init__(self, seq_len: int, factor: float = 1 / (2**8)) -> None:
         super().__init__()
-        # TODO register buffers etc
+        self._factor = factor
+        self._cached_seq_len = seq_len
+        self.register_buffer('_bias_buffer', self._get_bias(seq_len))
 
-    def foward(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'T'], offset: int = 0
-    ) -> Annotated[torch.Tensor, torch.bool, 'T', 'T']:
-        '''\
-        return causal mask for x
-        '''
-        mask_value = -torch.finfo(x.dtype).max
-        mask = torch.ones(
-            x.shape[-2], x.shape[-1], dtype=torch.bool, device=x.device
-        ).triu(offset)
-        return torch.masked_fill(x, ~mask, mask_value)
+    @staticmethod
+    def _get_bias(
+        l: int, device: torch.device | None = None
+    ) -> Annotated[torch.Tensor, 'T', 'T']:
+        a = torch.arange(0, l, device=device or 'cpu').reshape(-1, 1)
+        return -torch.relu(a - a.T)
+
+    def forward(
+        self, seq_len: int, n_heads: int, device: torch.device
+    ) -> Annotated[torch.Tensor, 'T', 'T', 'H']:
+        if seq_len > self._cached_seq_len:
+            next_power_of_two = 2 ** math.ceil(math.log2(seq_len))
+            self._cached_seq_len = next_power_of_two
+            self.register_buffer(
+                '_bias_buffer', self._get_bias(next_power_of_two, device)
+            )
+        bias = self._bias_buffer[:seq_len, :seq_len].reshape(-1, -1, 1)
+        head_factor = self._factor ** (1 / n_heads)
+        k = torch.pow(head_factor, torch.arange(0, n_heads, device=device)).reshape(
+            1, 1, -1
+        )
+        return bias * k
 
 
-def apply_causal_mask(
-    x: Annotated[torch.Tensor, ..., 'T', 'T']
-) -> Annotated[torch.Tensor, ..., 'T', 'T']:
-    assert x.shape[-2] == x.shape[-1]
-    L = x.shape[-1]
-
-    mask_value = -torch.finfo(x.dtype).max
-    mask = torch.triu(torch.ones(L, L, device=x.device), 1)
-
-    return torch.masked_fill(x, ~mask, mask_value)
+@dataclass
+class Intermediates:
+    ...
 
 
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
-class MultiHeadedAttention(nn.Module):
-
+class Attention(nn.Module):
     """\
     some implementation details were taken from https://github.com/lucidrains/x-transformers
     which is licended under the...
@@ -187,17 +209,24 @@ class MultiHeadedAttention(nn.Module):
     k_dim_head: int
     v_dim_head: int
 
-    use_rotary_pos_emb: bool
+    causal: bool
+    use_flash: bool
+
+    rotary_pos_emb: RotaryPositionEmbedding | None
+    attention_linear_bias: AttentionLinearBias | None
 
     def __init__(
         self,
         dim: int,
+        causal: bool = True,
+        use_flash: bool = False,
         num_heads: int = 8,
         k_dim_head: int = 64,
         v_dim_head: int = 64,
         value_dim: int | None = None,
         out_dim: int | None = None,
-        use_rotary_pos_emb: bool = True,
+        rotary_pos_emb: RotaryPositionEmbedding | None = None,
+        attention_linear_bias: AttentionLinearBias | None = None,
     ) -> None:
         super().__init__()
 
@@ -214,6 +243,16 @@ class MultiHeadedAttention(nn.Module):
         self.k_dim_head = k_dim_head
         self.v_dim_head = v_dim_head
 
+        self.causal = causal
+        self.use_flash = use_flash  # TODO implement flash
+
+        # positional embedding
+        assert (
+            rotary_pos_emb is None or attention_linear_bias is None
+        ), "can't use RoPE and ALiBi at the same time"
+        self.rotary_pos_emb = rotary_pos_emb
+        self.attention_linear_bias = attention_linear_bias
+
         v_dim = self.v_dim_head * self.num_heads
         q_dim = k_dim = self.k_dim_head * self.num_heads
 
@@ -222,17 +261,13 @@ class MultiHeadedAttention(nn.Module):
         self.w_v = nn.Linear(self.value_dim, v_dim, bias=False)
         self.w_o = nn.Linear(v_dim, self.out_dim, bias=False)
 
-        self.use_rotary_pos_emb = use_rotary_pos_emb
-
     def forward(
         self,
         q: Annotated[torch.Tensor, ..., 'T', 'K'],
         k: Annotated[torch.Tensor, ..., 'T', 'K'],
         v: Annotated[torch.Tensor, ..., 'T', 'V'],
         mask: Annotated[torch.Tensor, 'T', 'T'] | None = None,
-        rotary_freqs: Annotated[torch.Tensor, 'T', 'L'] | None = None,
-        rotary_pos_scale: float = 1.0,
-    ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
+    ) -> tuple[Annotated[torch.Tensor, ..., 'T', 'O'], Intermediates]:
         assert q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
         assert q.shape[-1] == k.shape[-1] == self.dim
         assert v.shape[-1] == self.value_dim
@@ -244,14 +279,23 @@ class MultiHeadedAttention(nn.Module):
         k_i = rearrange(self.w_k(k), '... T (H k) -> ... H T k', H=self.num_heads)
         v_i = rearrange(self.w_v(v), '... T (H v) -> ... H T v', H=self.num_heads)
 
-        if self.use_rotary_pos_emb:
-            assert rotary_freqs is not None
-            q_i, k_i, v_i = self.rotary_pos_emb(
-                q_i, k_i, v_i, rotary_freqs, rotary_pos_scale
-            )
+        if self.rotary_pos_emb is not None:
+            rope_dim = self.rotary_pos_emb.dim
+
+            def _apply(x: torch.Tensor) -> torch.Tensor:
+                if TYPE_CHECKING:
+                    assert self.rotary_pos_emb is not None
+                return torch.cat(
+                    (self.rotary_pos_emb(x[..., :rope_dim]), x[..., rope_dim:]), dim=-1
+                )
+
+            q_i = _apply(q_i)
+            k_i = _apply(k_i)
+            v_i = _apply(v_i)
 
         # use scaled dot product similarity
-        s_qk = einsum('... H i k, ... H j k -> ... H i j', q_i, k_i)
+        s_qk = einsum(q_i, k_i, '... H i k, ... H j k -> ... H i j')
+
         s_qk = s_qk / (q_i.shape[-1] ** 0.5)
 
         # apply mask
@@ -263,42 +307,54 @@ class MultiHeadedAttention(nn.Module):
         # softmax
         attn: Annotated[torch.Tensor, ..., 'H', 'T', 'T'] = F.softmax(s_qk, dim=-1)
 
-        vals = einsum('... H T i, ... H i v -> ... H T v', attn, v_i)
+        vals = einsum(attn, v_i, '... H T i, ... H i v -> ... H T v')
         out = self.w_o(rearrange(vals, '... H T v -> ... T (H v)'))
         return out
 
-    def _rotate_half(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'K']
-    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
-        x = rearrange(x, '... (j d) -> ... j d', j=2)
-        x1, x2 = x.unbind(dim=-2)
-        return torch.cat((-x2, x1), dim=-1)
 
-    def _apply_rotary_pos_emb(
-        self,
-        freqs: Annotated[torch.Tensor, 'T', 'L'],
-        x: Annotated[torch.Tensor, ..., 'T', 'K'],
-        scale: float | int,
-    ) -> Annotated[torch.Tensor, ..., 'T', 'K']:
-        seq_len = x.shape[-2]
-        freqs = freqs[-seq_len:, :]
-        return (x * freqs.cos() * scale) + (self._rotate_half(x) * freqs.sin() * scale)
+class MemaBlock(nn.Module):
+    dim: int
 
-    def rotary_pos_emb(
-        self,
-        q: Annotated[torch.Tensor, ..., 'T', 'K'],
-        k: Annotated[torch.Tensor, ..., 'T', 'K'],
-        v: Annotated[torch.Tensor, ..., 'T', 'V'],
-        freqs: Annotated[torch.Tensor, 'T', 'L'],
-        scale: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        L = freqs.shape[-1]
-        q_scale, k_scale = (scale, scale**-1.0)
-        (ql, qr), (kl, kr), (vl, vr) = map(
-            lambda t: (t[..., :L], t[..., L:]), (q, k, v)
-        )
+    attn: Attention
+    mlp: MultiLayerPerceptron
+    pre_norm: RMSNorm | LayerNorm
+    post_norm: RMSNorm | LayerNorm
 
-        args = ((ql, q_scale), (kl, k_scale), (vl, k_scale))
-        ql, kl, vl = map(lambda args: self._rotary_pos_emb(freqs, *args), args)
-        q, k, v = map(lambda t: torch.cat(t, dim=-1), ((ql, qr), (kl, kr), (vl, vr)))
-        return q, k, v
+    attn_dropout: nn.Dropout | None = None
+    dropout: nn.Dropout | None = None
+
+    def __init__(
+        self, dim: int, dropout: float | None = None, attn_dropout: float | None = None
+    ) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.attn = Attention(self.dim)
+        self.mlp = MultiLayerPerceptron(self.dim, hidden_dim=4 * self.dim)
+
+        self.pre_norm = RMSNorm(self.dim)
+        self.post_norm = RMSNorm(self.dim)
+
+        if dropout is not None:
+            self.dropout = nn.Dropout(dropout)
+
+        if attn_dropout is not None:
+            self.attn_dropout = nn.Dropout(attn_dropout)
+
+    def forward(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'D']
+    ) -> tuple[Annotated[torch.Tensor, ..., 'T', 'D'], Intermediates]:
+        k = self.pre_norm(x)
+        attn, inter = self.attn(k, k, k)
+
+        if self.attn_dropout is not None:
+            attn = self.attn_dropout(attn)
+
+        r = k + attn
+        m = self.post_norm(r)
+        m = self.mlp(m)
+
+        if self.dropout is not None:
+            m = self.dropout(m)
+
+        return r + m, inter
