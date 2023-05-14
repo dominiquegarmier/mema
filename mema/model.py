@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from einops import einsum
 from einops import rearrange
 
+from mema.config import MemaConfig
+from mema.nknn import NeuralKNearestNeighbor
+
 
 # https://arxiv.org/abs/1910.07467
 class RMSNorm(nn.Module):
@@ -175,11 +178,6 @@ class AttentionLinearBias(nn.Module):
         return bias * k
 
 
-@dataclass
-class Intermediates:
-    ...
-
-
 # Attention Is All You Need https://arxiv.org/abs/1706.03762
 class Attention(nn.Module):
     """\
@@ -267,7 +265,7 @@ class Attention(nn.Module):
         k: Annotated[torch.Tensor, ..., 'T', 'K'],
         v: Annotated[torch.Tensor, ..., 'T', 'V'],
         mask: Annotated[torch.Tensor, 'T', 'T'] | None = None,
-    ) -> tuple[Annotated[torch.Tensor, ..., 'T', 'O'], Intermediates]:
+    ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
         assert q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
         assert q.shape[-1] == k.shape[-1] == self.dim
         assert v.shape[-1] == self.value_dim
@@ -312,19 +310,56 @@ class Attention(nn.Module):
         return out
 
 
+class Memory(nn.Module):
+    dim: int
+    dim_embed: int
+    k: int
+
+    nknn: NeuralKNearestNeighbor
+
+    def __init__(self, dim: int, k: int = 8, dim_embed: int = 256) -> None:
+        super().__init__()
+
+        self.dim = dim
+        self.dim_embed = dim_embed
+        self.k = k
+
+        self.nknn = NeuralKNearestNeighbor(
+            self.k, self.dim, temp=0.1, feature=dim_embed
+        )
+        self.proj_out = nn.Linear(self.dim_embed * self.k, self.dim)
+
+    def foward(
+        self, x: Annotated[torch.Tensor, ..., 'T', 'D']
+    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
+        # TODO actually add the memory
+        nearest = self.nknn(x, ..., ...)
+        nearest = rearrange(nearest, '... K F -> ... (K F)')
+        out = self.proj_out(nearest)
+        return out
+
+
 class MemaBlock(nn.Module):
     dim: int
 
     attn: Attention
     mlp: MultiLayerPerceptron
+    memory: Memory | None = None
+
     pre_norm: RMSNorm | LayerNorm
     post_norm: RMSNorm | LayerNorm
 
     attn_dropout: nn.Dropout | None = None
+    mem_dropout: nn.Dropout | None = None
     dropout: nn.Dropout | None = None
 
     def __init__(
-        self, dim: int, dropout: float | None = None, attn_dropout: float | None = None
+        self,
+        dim: int,
+        dropout: float | None = None,
+        attn_dropout: float | None = None,
+        memory: bool = False,
+        mem_dropout: float | None = None,  # TODO memory ingest?
     ) -> None:
         super().__init__()
 
@@ -341,14 +376,26 @@ class MemaBlock(nn.Module):
         if attn_dropout is not None:
             self.attn_dropout = nn.Dropout(attn_dropout)
 
+        assert memory is not None or mem_dropout is None, 'mem_dropout requires memory'
+        if memory:
+            self.memory = Memory(self.dim)
+        if mem_dropout is not None:
+            self.mem_dropout = nn.Dropout(mem_dropout)
+
     def forward(
         self, x: Annotated[torch.Tensor, ..., 'T', 'D']
-    ) -> tuple[Annotated[torch.Tensor, ..., 'T', 'D'], Intermediates]:
+    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
         k = self.pre_norm(x)
-        attn, inter = self.attn(k, k, k)
+        attn = self.attn(k, k, k)
 
         if self.attn_dropout is not None:
             attn = self.attn_dropout(attn)
+
+        if self.memory is not None:
+            mem = self.memory(k)
+            if self.mem_dropout is not None:
+                mem = self.mem_dropout(mem)
+            attn = attn + mem
 
         r = k + attn
         m = self.post_norm(r)
@@ -357,4 +404,30 @@ class MemaBlock(nn.Module):
         if self.dropout is not None:
             m = self.dropout(m)
 
-        return r + m, inter
+        return r + m
+
+
+class MemaModel(nn.Module):
+    config: MemaConfig
+
+    embedding: nn.Embedding
+    blocks: nn.ModuleList
+    last_norm: RMSNorm | LayerNorm
+
+    def __init__(self, config: MemaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embedding = nn.Embedding(self.config.vocab_size, self.config.d_model)
+        self.last_norm = LayerNorm(self.config.d_model)
+
+        self.layers = nn.ModuleList()
+        for _ in range(self.config.n_layers):
+            layer = MemaBlock(dim=self.config.d_model)  # TODO add other params
+            self.layers.append(layer)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(tokens)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.last_norm(x)
+        return x
