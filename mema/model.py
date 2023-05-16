@@ -311,31 +311,49 @@ class Attention(nn.Module):
 
 
 class Memory(nn.Module):
-    dim: int
-    dim_embed: int
     k: int
 
-    nknn: NeuralKNearestNeighbor
+    dim: int
+    dim_mem: int
+    dim_key: int
 
-    def __init__(self, dim: int, k: int = 8, dim_embed: int = 256) -> None:
+    nknn: NeuralKNearestNeighbor
+    norm: LayerNorm | RMSNorm
+    proj_in: nn.Linear
+    proj_out: nn.Linear
+
+    def __init__(
+        self, dim: int, k: int = 8, dim_mem: int = 256, dim_key: int | None = None
+    ) -> None:
         super().__init__()
 
         self.dim = dim
-        self.dim_embed = dim_embed
+
+        if dim_key is None:
+            dim_key = dim_mem
+
+        self.dim_mem = dim_mem
+        self.dim_key = dim_key
+
         self.k = k
 
-        self.nknn = NeuralKNearestNeighbor(
-            self.k, self.dim, temp=0.1, feature=dim_embed
-        )
-        self.proj_out = nn.Linear(self.dim_embed * self.k, self.dim)
+        self.proj_in = nn.Linear(self.dim, self.dim_key)
+        self.nknn = NeuralKNearestNeighbor(self.k, self.dim, temp=0.1, feature=dim_mem)
+        self.proj_out = nn.Linear(self.dim_mem * self.k, self.dim)
+        self.norm = RMSNorm(self.dim)
 
     def foward(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'D']
-    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
-        # TODO actually add the memory
-        nearest = self.nknn(x, ..., ...)
+        self,
+        x: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        k: Annotated[torch.Tensor, ..., 'N', 'K'],
+        v: Annotated[torch.Tensor, ..., 'N', 'V'],
+    ) -> Annotated[torch.Tensor, ..., 'B', 'T', 'D']:
+        q = self.proj_in(x)
+        nearest = self.nknn(q, k, v)
         nearest = rearrange(nearest, '... K F -> ... (K F)')
+
         out = self.proj_out(nearest)
+        out = self.norm(out)
         return out
 
 
@@ -356,9 +374,9 @@ class MemaBlock(nn.Module):
     def __init__(
         self,
         dim: int,
+        memory: bool = False,
         dropout: float | None = None,
         attn_dropout: float | None = None,
-        memory: bool = False,
         mem_dropout: float | None = None,  # TODO memory ingest?
     ) -> None:
         super().__init__()
@@ -383,8 +401,14 @@ class MemaBlock(nn.Module):
             self.mem_dropout = nn.Dropout(mem_dropout)
 
     def forward(
-        self, x: Annotated[torch.Tensor, ..., 'T', 'D']
+        self,
+        x: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        mem_keys: Annotated[torch.Tensor, ..., 'N', 'K'] | None,
+        mem_values: Annotated[torch.Tensor, ..., 'N', 'V'] | None,
     ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
+        if self.memory is not None:
+            assert mem_values is not None and mem_keys is not None
+
         k = self.pre_norm(x)
         attn = self.attn(k, k, k)
 
@@ -392,7 +416,7 @@ class MemaBlock(nn.Module):
             attn = self.attn_dropout(attn)
 
         if self.memory is not None:
-            mem = self.memory(k)
+            mem = self.memory(k, mem_keys, mem_values)
             if self.mem_dropout is not None:
                 mem = self.mem_dropout(mem)
             attn = attn + mem
@@ -421,8 +445,20 @@ class MemaModel(nn.Module):
         self.last_norm = LayerNorm(self.config.d_model)
 
         self.layers = nn.ModuleList()
-        for _ in range(self.config.n_layers):
-            layer = MemaBlock(dim=self.config.d_model)  # TODO add other params
+        for i in range(self.config.n_layers):
+            memory = (
+                i % self.config.mem_layer_spacing == 0
+                and i < self.config.n_layers * self.config.n_mem_layers  # noqa
+            )
+
+            layer = MemaBlock(
+                dim=self.config.d_model,
+                memory=memory,
+                dropout=self.config.dropout,
+                attn_dropout=self.config.attn_dropout,
+                mem_dropout=self.config.mem_dropout if memory else None,
+            )
+
             self.layers.append(layer)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:

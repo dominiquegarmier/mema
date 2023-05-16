@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import einsum
+from einops import rearrange
 
 
 # Neural Nearest Neighbor Networks https://arxiv.org/abs/1810.12575
@@ -29,53 +30,72 @@ class NeuralKNearestNeighbor(nn.Module):
     copies or substantial portions of the Software.
     """
 
-    _k: int
-    _temp: float
-    _dim: int
-    _feature: int
+    k: int
+    temp: float
+    dim: int
+    feature: int
+    mask: bool
 
-    _no_values: bool = False
+    no_values: bool = False
 
     def __init__(
-        self, k: int, dim: int, temp: float, feature: int | None = None
+        self,
+        k: int,
+        dim: int,
+        temp: float,
+        feature: int | None = None,
+        mask: bool = True,
     ) -> None:
         super().__init__()
-        self._k = k
-        self._temp = temp
+        self.k = k
+        self.temp = temp
 
-        self._dim = dim
-        self._feature = feature or dim
+        self.dim = dim
+        self.feature = feature or dim
         if feature is None:
             self._no_values = True
 
+        self.mask = mask
+
     def forward(
         self,
-        query: Annotated[torch.Tensor, ..., 'D'],
-        keys: Annotated[torch.Tensor, ..., 'D', 'N'],
-        values: Annotated[torch.Tensor, ..., 'F', 'N'] | None = None,
-    ) -> Annotated[torch.Tensor, ..., 'K', 'F']:
+        query: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        keys: Annotated[torch.Tensor, ..., 'N', 'D'],
+        values: Annotated[torch.Tensor, ..., 'N', 'F'] | None = None,
+    ) -> Annotated[torch.Tensor, ..., 'B', 'T', 'K', 'F']:
         if values is None:
-            assert self._no_values
+            assert self.no_values
             values = keys
-        assert query.shape[-1] == keys.shape[-2] == self._dim
-        assert values.shape[-2] == self._feature
+        assert query.shape[-1] == keys.shape[-2] == self.dim
+        assert values.shape[-2] == self.feature
         assert keys.shape[-1] == values.shape[-1]
 
         sims = self._similarity(query, keys)
-        omega = self._compute_omega(s=sims, k=self._k, t=self._temp)
-        k_nearest = einsum(omega, values, '... N K, ... F N -> ... K F')
+        omega = self._compute_omega(s=sims, k=self.k, t=self.temp)
+
+        k_nearest = einsum(
+            omega, values, '... B N T K, ... N F -> ... B T K F'
+        )  # TODO this is not well defined
         return k_nearest
 
     def _similarity(
         self,
-        query: Annotated[torch.Tensor, ..., 'D'],
-        key: Annotated[torch.Tensor, ..., 'D', 'N'],
-    ) -> Annotated[torch.Tensor, ..., 'N']:
-        return -einsum(query, key, '... D, ... D N -> ... N') / (self._dim**0.5)
+        query: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        key: Annotated[torch.Tensor, ..., 'N', 'D'],
+    ) -> Annotated[torch.Tensor, ..., 'B', 'N', 'T']:
+        """
+        "B": inner batch that shares same keys
+        """
+        assert query.shape[-1] == key.shape[-1] == self.dim
+        assert query.shape[-3] == key.shape[-3]
+        assert query.shape[:-3] == key.shape[:-3]  # check outer batch dimensions
+
+        sim = -einsum(query, key, '... B T D, ... N D -> ... B N T') / (self.dim**0.5)
+        return sim
 
     def _compute_omega(
-        self, s: Annotated[torch.Tensor, ..., 'N'], k: int, t: float
-    ) -> Annotated[torch.Tensor, ..., 'N', 'K']:
+        self, s: Annotated[torch.Tensor, ..., 'B', 'N', 'T'], k: int, t: float
+    ) -> Annotated[torch.Tensor, ..., 'B', 'N', 'T', 'K']:
         alpha = F.softmax(s, dim=-1)
         omega = torch.empty(*s.shape, k)
 
