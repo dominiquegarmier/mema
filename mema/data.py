@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-from typing import Annotated, Generator, TypeAlias, TYPE_CHECKING, Iterable
-from datasets import Dataset
+from typing import Annotated
+from collections.abc import Generator
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
+from typing import TypeAlias
+
 import torch
+from datasets import Dataset
 
 
 def similarity_batcher() -> None:
     raise NotImplementedError
 
 
-def tokenize() -> None:
-    ...
+def tokenize() -> None: ...
+
 
 def tokenize_dataset(dataset: Dataset):
     dataset.map(tokenize)
 
 
-TSeq: TypeAlias = Annotated[torch.Tensor, "B", "T", "D"]
-TMemKeys: TypeAlias = Annotated[torch.Tensor, "M", "K"]
-TMemVals: TypeAlias = Annotated[torch.Tensor, "M", "V"]
+TSeq: TypeAlias = Annotated[torch.Tensor, 'B', 'T', 'D']
+TMemKeys: TypeAlias = Annotated[torch.Tensor, 'M', 'K']
+TMemVals: TypeAlias = Annotated[torch.Tensor, 'M', 'V']
 
 
 def sequencer(
