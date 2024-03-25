@@ -4,13 +4,11 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class AlibiConfig:
-    ...
+class AlibiConfig: ...
 
 
 @dataclass(frozen=True)
-class RoPEConfig:
-    ...
+class RoPEConfig: ...
 
 
 @dataclass(frozen=True)

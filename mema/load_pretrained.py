@@ -31,12 +31,10 @@ class ParameterTree:
 # TODO we might need to change the tree topology
 class NodeVisitor(metaclass=ABCMeta):
     @abstractmethod
-    def root(self, root: str | None) -> str | None:
-        ...
+    def root(self, root: str | None) -> str | None: ...
 
     @abstractmethod
-    def visitor(self, id: str) -> NodeVisitor:
-        ...
+    def visitor(self, id: str) -> NodeVisitor: ...
 
     def visit(self, node: ParameterTree) -> ParameterTree:
         children: dict[str, ParameterTree] = {}
@@ -54,5 +52,4 @@ class IdentityVisitor(NodeVisitor):
         return IdentityVisitor()
 
 
-class GPTNeoXVisitor(IdentityVisitor):
-    ...
+class GPTNeoXVisitor(IdentityVisitor): ...
