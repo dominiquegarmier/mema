@@ -16,7 +16,7 @@ def load_from_pretrained_gpt_neox() -> None:
 
 
 def convert_from_gpt_neox(
-    state_dict: dict[str, torch.Tensor]
+    state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     raise NotImplementedError
 
@@ -31,12 +31,10 @@ class ParameterTree:
 # TODO we might need to change the tree topology
 class NodeVisitor(metaclass=ABCMeta):
     @abstractmethod
-    def root(self, root: str | None) -> str | None:
-        ...
+    def root(self, root: str | None) -> str | None: ...
 
     @abstractmethod
-    def visitor(self, id: str) -> NodeVisitor:
-        ...
+    def visitor(self, id: str) -> NodeVisitor: ...
 
     def visit(self, node: ParameterTree) -> ParameterTree:
         children: dict[str, ParameterTree] = {}
@@ -54,5 +52,4 @@ class IdentityVisitor(NodeVisitor):
         return IdentityVisitor()
 
 
-class GPTNeoXVisitor(IdentityVisitor):
-    ...
+class GPTNeoXVisitor(IdentityVisitor): ...
