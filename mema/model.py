@@ -71,8 +71,8 @@ class MultiLayerPerceptron(nn.Module):
         self.act = nn.GELU()  # TODO support other activations
 
     def forward(
-        self, x: Annotated[torch.Tensor, ..., "D"]
-    ) -> Annotated[torch.Tensor, ..., "D"]:
+        self, x: Annotated[torch.Tensor, ..., 'D']
+    ) -> Annotated[torch.Tensor, ..., 'D']:
         return self.lin_out(self.act(self.lin_in(x)))
 
 
@@ -87,8 +87,8 @@ class RotaryPositionEmbedding(nn.Module):
     dim: int
 
     _seq_len_cached: int
-    _freqs_cis: Annotated[torch.Tensor, torch.complex64, "T", "D"]
-    _scale: Annotated[torch.Tensor, "D"]
+    _freqs_cis: Annotated[torch.Tensor, torch.complex64, 'T', 'D']
+    _scale: Annotated[torch.Tensor, 'D']
 
     def __init__(self, dim: int, seq_len: int = 2048, theta: float = 10000.0) -> None:
         super().__init__()
@@ -97,42 +97,42 @@ class RotaryPositionEmbedding(nn.Module):
 
         assert seq_len >= 1
         freqs_cis = self._get_freqs_cis(seq_len)
-        self.register_buffer("_freqs_cis", freqs_cis)
+        self.register_buffer('_freqs_cis', freqs_cis)
 
     def _get_freqs_cis(
         self, seq_len: int, device: torch.device | None = None
-    ) -> Annotated[torch.Tensor, torch.complex64, "T", "D"]:
+    ) -> Annotated[torch.Tensor, torch.complex64, 'T', 'D']:
         self._seq_len_cached = seq_len
         half = self.dim // 2  # only apply to half of the dimensions, see the paper
         freqs = self.theta ** -(
-            torch.arange(0, half, device=device or "cpu").float() / half
+            torch.arange(0, half, device=device or 'cpu').float() / half
         )
         seq = torch.arange(seq_len, device=freqs.device)
-        freqs = einsum(seq, freqs, "T, D -> T D")
+        freqs = einsum(seq, freqs, 'T, D -> T D')
         freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
         return freqs_cis
 
     def get_freqs_cis(
         self, seq_len: int, device: torch.device
-    ) -> Annotated[torch.Tensor, torch.complex64, "T", "D/2"]:
+    ) -> Annotated[torch.Tensor, torch.complex64, 'T', 'D/2']:
         if seq_len > self._seq_len_cached:
             next_power_of_two = 2 ** math.ceil(math.log2(seq_len))
             freqs_cis = self._get_freqs_cis(next_power_of_two, device=device)
-            self.register_buffer("_freqs_cis", freqs_cis)
+            self.register_buffer('_freqs_cis', freqs_cis)
         return self._freqs_cis[-seq_len:, :]
 
     @staticmethod
     def rotate_half(
-        x: Annotated[torch.Tensor, ..., "D"]
-    ) -> Annotated[torch.Tensor, ..., "D"]:
-        x = rearrange(x, "... (j d) -> ... j d", j=2)
+        x: Annotated[torch.Tensor, ..., 'D'],
+    ) -> Annotated[torch.Tensor, ..., 'D']:
+        x = rearrange(x, '... (j d) -> ... j d', j=2)
         x1, x2 = x.unbind(dim=-2)
         return torch.cat((-x2, x1), dim=-1)
 
     def forward(
         self,
-        x: Annotated[torch.Tensor, ..., "T", "D"],
-    ) -> Annotated[torch.Tensor, ..., "T", "D"]:
+        x: Annotated[torch.Tensor, ..., 'T', 'D'],
+    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
         """applies rotary embeddings to x"""
         freqs_cis = self.get_freqs_cis(x.shape[-2], device=x.device)
         assert x.shape[-1] == freqs_cis.shape[-1]
@@ -145,30 +145,30 @@ class RotaryPositionEmbedding(nn.Module):
 # https://arxiv.org/abs/2108.12409
 class AttentionLinearBias(nn.Module):
     _cached_seq_len: int
-    _bias_buffer: Annotated[torch.Tensor, "T", "T"]
+    _bias_buffer: Annotated[torch.Tensor, 'T', 'T']
     _factor: float
 
     def __init__(self, seq_len: int, factor: float = 1 / (2**8)) -> None:
         super().__init__()
         self._factor = factor
         self._cached_seq_len = seq_len
-        self.register_buffer("_bias_buffer", self._get_bias(seq_len))
+        self.register_buffer('_bias_buffer', self._get_bias(seq_len))
 
     @staticmethod
     def _get_bias(
         l: int, device: torch.device | None = None
-    ) -> Annotated[torch.Tensor, "T", "T"]:
-        a = torch.arange(0, l, device=device or "cpu").reshape(-1, 1)
+    ) -> Annotated[torch.Tensor, 'T', 'T']:
+        a = torch.arange(0, l, device=device or 'cpu').reshape(-1, 1)
         return -torch.relu(a - a.T)
 
     def forward(
         self, seq_len: int, n_heads: int, device: torch.device
-    ) -> Annotated[torch.Tensor, "T", "T", "H"]:
+    ) -> Annotated[torch.Tensor, 'T', 'T', 'H']:
         if seq_len > self._cached_seq_len:
             next_power_of_two = 2 ** math.ceil(math.log2(seq_len))
             self._cached_seq_len = next_power_of_two
             self.register_buffer(
-                "_bias_buffer", self._get_bias(next_power_of_two, device)
+                '_bias_buffer', self._get_bias(next_power_of_two, device)
             )
         bias = self._bias_buffer[:seq_len, :seq_len].reshape(-1, -1, 1)
         head_factor = self._factor ** (1 / n_heads)
@@ -261,11 +261,11 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        q: Annotated[torch.Tensor, ..., "T", "K"],
-        k: Annotated[torch.Tensor, ..., "T", "K"],
-        v: Annotated[torch.Tensor, ..., "T", "V"],
-        mask: Annotated[torch.Tensor, "T", "T"] | None = None,
-    ) -> Annotated[torch.Tensor, ..., "T", "O"]:
+        q: Annotated[torch.Tensor, ..., 'T', 'K'],
+        k: Annotated[torch.Tensor, ..., 'T', 'K'],
+        v: Annotated[torch.Tensor, ..., 'T', 'V'],
+        mask: Annotated[torch.Tensor, 'T', 'T'] | None = None,
+    ) -> Annotated[torch.Tensor, ..., 'T', 'O']:
         assert q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
         assert q.shape[-1] == k.shape[-1] == self.dim
         assert v.shape[-1] == self.value_dim
@@ -273,9 +273,9 @@ class Attention(nn.Module):
             assert mask.shape == (q.shape[-2], k.shape[-2])
         B = q.shape[:-2]  # batch shape
 
-        q_i = rearrange(self.w_q(q), "... T (H k) -> ... H T k", H=self.num_heads)
-        k_i = rearrange(self.w_k(k), "... T (H k) -> ... H T k", H=self.num_heads)
-        v_i = rearrange(self.w_v(v), "... T (H v) -> ... H T v", H=self.num_heads)
+        q_i = rearrange(self.w_q(q), '... T (H k) -> ... H T k', H=self.num_heads)
+        k_i = rearrange(self.w_k(k), '... T (H k) -> ... H T k', H=self.num_heads)
+        v_i = rearrange(self.w_v(v), '... T (H v) -> ... H T v', H=self.num_heads)
 
         if self.rotary_pos_emb is not None:
             rope_dim = self.rotary_pos_emb.dim
@@ -292,7 +292,7 @@ class Attention(nn.Module):
             v_i = _apply(v_i)
 
         # use scaled dot product similarity
-        s_qk = einsum(q_i, k_i, "... H i k, ... H j k -> ... H i j")
+        s_qk = einsum(q_i, k_i, '... H i k, ... H j k -> ... H i j')
 
         s_qk = s_qk / (q_i.shape[-1] ** 0.5)
 
@@ -303,10 +303,10 @@ class Attention(nn.Module):
             s_qk = s_qk.masked_fill(~mask, mask_value)
 
         # softmax
-        attn: Annotated[torch.Tensor, ..., "H", "T", "T"] = F.softmax(s_qk, dim=-1)
+        attn: Annotated[torch.Tensor, ..., 'H', 'T', 'T'] = F.softmax(s_qk, dim=-1)
 
-        vals = einsum(attn, v_i, "... H T i, ... H i v -> ... H T v")
-        out = self.w_o(rearrange(vals, "... H T v -> ... T (H v)"))
+        vals = einsum(attn, v_i, '... H T i, ... H i v -> ... H T v')
+        out = self.w_o(rearrange(vals, '... H T v -> ... T (H v)'))
         return out
 
 
@@ -344,13 +344,13 @@ class Memory(nn.Module):
 
     def foward(
         self,
-        x: Annotated[torch.Tensor, ..., "B", "T", "D"],
-        k: Annotated[torch.Tensor, ..., "N", "K"],
-        v: Annotated[torch.Tensor, ..., "N", "V"],
-    ) -> Annotated[torch.Tensor, ..., "B", "T", "D"]:
+        x: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        k: Annotated[torch.Tensor, ..., 'N', 'K'],
+        v: Annotated[torch.Tensor, ..., 'N', 'V'],
+    ) -> Annotated[torch.Tensor, ..., 'B', 'T', 'D']:
         q = self.proj_in(x)
         nearest = self.nknn(q, k, v)
-        nearest = rearrange(nearest, "... K F -> ... (K F)")
+        nearest = rearrange(nearest, '... K F -> ... (K F)')
 
         out = self.proj_out(nearest)
         out = self.norm(out)
@@ -394,7 +394,7 @@ class MemaBlock(nn.Module):
         if attn_dropout is not None:
             self.attn_dropout = nn.Dropout(attn_dropout)
 
-        assert memory is not None or mem_dropout is None, "mem_dropout requires memory"
+        assert memory is not None or mem_dropout is None, 'mem_dropout requires memory'
         if memory:
             self.memory = Memory(self.dim)
         if mem_dropout is not None:
@@ -402,10 +402,10 @@ class MemaBlock(nn.Module):
 
     def forward(
         self,
-        x: Annotated[torch.Tensor, ..., "B", "T", "D"],
-        mem_keys: Annotated[torch.Tensor, ..., "N", "K"] | None,
-        mem_values: Annotated[torch.Tensor, ..., "N", "V"] | None,
-    ) -> Annotated[torch.Tensor, ..., "T", "D"]:
+        x: Annotated[torch.Tensor, ..., 'B', 'T', 'D'],
+        mem_keys: Annotated[torch.Tensor, ..., 'N', 'K'] | None,
+        mem_values: Annotated[torch.Tensor, ..., 'N', 'V'] | None,
+    ) -> Annotated[torch.Tensor, ..., 'T', 'D']:
         if self.memory is not None:
             assert mem_values is not None and mem_keys is not None
 
@@ -465,8 +465,8 @@ class MemaModel(nn.Module):
             self.layers.append(layer)
 
     def forward(
-        self, tokens: Annotated[torch.Tensor, ..., "T"]
-    ) -> Annotated[torch.Tensor, ..., "T", "V"]:
+        self, tokens: Annotated[torch.Tensor, ..., 'T']
+    ) -> Annotated[torch.Tensor, ..., 'T', 'V']:
         x = self.embedding(tokens)
         for layer in self.layers:
             x = layer(x)
